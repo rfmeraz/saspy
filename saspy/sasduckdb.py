@@ -885,17 +885,189 @@ _PRECISION_LOSS_TYPES = ('BIGINT', 'HUGEINT', 'UBIGINT', 'UHUGEINT')
 SAS_MAX_CHAR = 32767
 
 
+_CHAR_BASES = ('VARCHAR', 'CHAR', 'UUID', 'ENUM')
+
+
+def _is_char_dtype(dtype):
+    return any(dtype.startswith(b) for b in _CHAR_BASES)
+
+
+def _upper_dict(d):
+    return {k.upper(): v for k, v in d.items()} if d else {}
+
+
+def _build_load_codegen(cols, char_len, tmpdir_or_none, libref, table,
+                        outfmts=None, labels=None, outdsopts=None,
+                        datetimes=None, annotate=None, block=None, snum=None,
+                        csv_path=None):
+    """Per-column codegen shared by the load and codegen-only paths.
+
+    Returns (sel_parts, data_step_code). cols: [(name, DTYPE)]; char_len:
+    {name: bytes}; csv_path: real path, or a placeholder for codegen-only.
+    """
+    fmt_upper = _upper_dict(outfmts)
+    lab_upper = _upper_dict(labels)
+    dts_upper = _upper_dict(datetimes)
+
+    sel_parts = []
+    lengths = []
+    formats = []
+    label_lines = []
+    inputs = []
+    for name, dtype in cols:
+        qn = '"' + name.replace('"', '""') + '"'
+        nl = "'" + name.replace("'", "''") + "'n"
+        up = name.upper()
+        base = dtype.split('(')[0]
+        default_fmt = None
+        if base in _UNSUPPORTED_DUCK_TYPES or dtype.endswith('[]'):
+            raise SASDuckDBNotSupportedError(
+                'Result column "{}" has DuckDB type {} which cannot be '
+                'loaded into SAS. Cast it in your SQL.'.format(name, dtype),
+                block=block, stmt=snum)
+        if base in _PRECISION_LOSS_TYPES and annotate:
+            annotate('warning: column "{}" ({}) may lose precision in SAS '
+                     'numeric (double)'.format(name, dtype))
+        if base == 'DECIMAL':
+            m = re.match(r'DECIMAL\((\d+)', dtype)
+            if m and int(m.group(1)) > 15 and annotate:
+                annotate('warning: column "{}" ({}) may lose precision in '
+                         'SAS numeric (double)'.format(name, dtype))
+        as_date = (base.startswith('TIMESTAMP') or base == 'DATETIME') and \
+            str(dts_upper.get(up, '')).lower() == 'date'
+        if name in char_len:
+            sel_parts.append(
+                "replace(replace({q}::varchar, chr(13), ' '), chr(10), ' ')"
+                ' as {q}'.format(q=qn))
+            lengths.append('{} ${}'.format(nl, char_len[name]))
+            inputs.append('{} : ${}.'.format(nl, char_len[name]))
+        elif base == 'BOOLEAN':
+            sel_parts.append('{q}::int as {q}'.format(q=qn))
+            lengths.append('{} 8'.format(nl))
+            inputs.append(nl)
+        elif base == 'DATE' or as_date:
+            sel_parts.append('{q}::date as {q}'.format(q=qn)
+                             if as_date else qn)
+            lengths.append('{} 8'.format(nl))
+            default_fmt = 'E8601DA.'
+            inputs.append('{} : ??yymmdd10.'.format(nl))
+        elif base.startswith('TIMESTAMP') or base == 'DATETIME':
+            # covers TIMESTAMP, DATETIME, TIMESTAMP_NS/_MS/_S, and
+            # TIMESTAMP WITH TIME ZONE - all normalized to microsecond
+            # timezone-naive timestamps for the CSV
+            if base in ('TIMESTAMP', 'DATETIME'):
+                sel_parts.append(qn)
+            else:
+                if annotate:
+                    if 'ZONE' in base or 'TZ' in base:
+                        annotate('note: column "{}" converted to '
+                                 'timezone-naive timestamp'.format(name))
+                    elif base == 'TIMESTAMP_NS':
+                        annotate('note: column "{}" truncated from nano- '
+                                 'to microsecond precision'.format(name))
+                sel_parts.append('{q}::timestamp as {q}'.format(q=qn))
+            lengths.append('{} 8'.format(nl))
+            default_fmt = 'E8601DT26.6'
+            inputs.append('{} : ??e8601dt26.6'.format(nl))
+        elif base.startswith('TIME'):
+            # covers TIME and TIME WITH TIME ZONE
+            if base == 'TIME':
+                sel_parts.append(qn)
+            else:
+                if annotate:
+                    annotate('note: column "{}" converted to timezone-'
+                             'naive time'.format(name))
+                sel_parts.append('{q}::time as {q}'.format(q=qn))
+            lengths.append('{} 8'.format(nl))
+            default_fmt = 'E8601TM15.6'
+            inputs.append('{} : ??e8601tm15.6'.format(nl))
+        else:
+            sel_parts.append(qn)
+            lengths.append('{} 8'.format(nl))
+            inputs.append(nl)
+
+        fmt = fmt_upper.get(up, default_fmt)
+        if fmt:
+            formats.append('{} {}'.format(nl, fmt))
+        if up in lab_upper:
+            label_lines.append('  label {} = "{}";\n'.format(
+                nl, str(lab_upper[up]).replace('"', '""')))
+
+    lrecl = max(1048576, sum(char_len.values()) + 64 * len(cols))
+    target = _sas_name_ref(libref, table)
+    if outdsopts:
+        target += '({})'.format(' '.join(
+            '{}={}'.format(k, v) for k, v in outdsopts.items()))
+    code = 'data {};\n'.format(target)
+    code += '  length {};\n'.format(' '.join(lengths))
+    if formats:
+        code += '  format {};\n'.format(' '.join(formats))
+    code += ''.join(label_lines)
+    code += ("  infile '{p}' dlm=',' dsd firstobs=2 missover lrecl={l} "
+             "encoding='utf-8' termstr=LF;\n").format(
+                 p=(csv_path or '<csv written by DuckDB COPY>')
+                 .replace("'", "''"), l=lrecl)
+    code += '  input {};\nrun;\n'.format(' '.join(inputs))
+    return sel_parts, code
+
+
+def _validate_char_len(name, n, block=None, snum=None):
+    if n > SAS_MAX_CHAR:
+        raise SASDuckDBTransferError(
+            'Column "{}" has values longer than the SAS maximum of '
+            '{} bytes.'.format(name, SAS_MAX_CHAR), block=block, stmt=snum)
+    return max(1, int(n))
+
+
 def duckdb_relation_to_sas_table(sas, con, select_sql, libref, table, tmpdir,
-                                 annotate=None, tempkeep=False,
-                                 keep_as=None, block=None, snum=None):
+                                 annotate=None, tempkeep=False, keep_as=None,
+                                 outfmts=None, labels=None, outdsopts=None,
+                                 char_lengths=None, datetimes=None,
+                                 codegen_only=False, block=None, snum=None):
     """Materialize select_sql once in DuckDB, COPY it to a tmpfs CSV, and load
     it into SAS with a generated DATA step. Returns the row count.
 
     keep_as: (schema, name) to keep the materialized result in the connection
     (used so later SQL blocks can reference a CTAS result without re-shipping);
     None materializes to a session-temp table dropped afterward.
+
+    Optional per-column overrides (dicts keyed by column name, case
+    insensitive): outfmts (SAS format replacing the default), labels,
+    outdsopts (dataset options on the created table), char_lengths (explicit
+    byte lengths - covered columns are excluded from the strlen scan),
+    datetimes ({col: 'date'} loads a TIMESTAMP column as a SAS date).
+
+    codegen_only=True generates and returns the DATA step code WITHOUT
+    executing anything: schema comes from a bind-only DESCRIBE, char lengths
+    from char_lengths or a 1024 placeholder (teach_me_SAS support).
     """
     import duckdb as _duckdb
+
+    chr_upper = _upper_dict(char_lengths)
+
+    if codegen_only:
+        try:
+            schema_rows = con.execute('describe ({})'.format(select_sql)
+                                      ).fetchall()
+        except _duckdb.Error as e:
+            raise SASDuckDBExecutionError(
+                'DuckDB failed parsing SQL: {}'.format(e),
+                block=block, stmt=snum) from e
+        cols = [(r[0], r[1].upper()) for r in schema_rows]
+        char_len = {}
+        for n, t in cols:
+            if _is_char_dtype(t):
+                given = chr_upper.get(n.upper())
+                char_len[n] = (_validate_char_len(n, given, block, snum)
+                               if given else 1024)
+        _sel, code = _build_load_codegen(
+            cols, char_len, None, libref, table, outfmts=outfmts,
+            labels=labels, outdsopts=outdsopts, datetimes=datetimes,
+            block=block, snum=snum, csv_path=None)
+        note = ('/* teach_me_SAS: generated without executing the query; '
+                'unlisted char lengths default to 1024 (computed from the '
+                'data on a real run) */\n')
+        return note + code
 
     if keep_as:
         schema, dname = keep_as
@@ -926,98 +1098,34 @@ def duckdb_relation_to_sas_table(sas, con, select_sql, libref, table, tmpdir,
         schema_rows = con.execute('describe {}'.format(qual)).fetchall()
         cols = [(r[0], r[1].upper()) for r in schema_rows]
 
-        # char lengths in BYTES (strlen), one scan for all char columns
-        char_cols = [n for n, t in cols
-                     if t.startswith('VARCHAR') or t.startswith('CHAR')
-                     or t in ('UUID', 'ENUM') or t.startswith('ENUM')]
+        # char lengths in BYTES (strlen); explicit char_lengths skip the
+        # scan for their columns, and the scan is skipped entirely when all
+        # char columns are covered
+        char_cols = [n for n, t in cols if _is_char_dtype(t)]
         char_len = {}
-        if char_cols and nrows:
+        unmapped = []
+        for n in char_cols:
+            given = chr_upper.get(n.upper())
+            if given:
+                char_len[n] = _validate_char_len(n, given, block, snum)
+            else:
+                unmapped.append(n)
+        if unmapped and nrows:
             aggs = ', '.join('max(strlen("{}"::varchar))'
-                             .format(n.replace('"', '""')) for n in char_cols)
+                             .format(n.replace('"', '""')) for n in unmapped)
             vals = con.execute('select {} from {}'.format(aggs, qual)).fetchone()
-            for n, v in zip(char_cols, vals):
-                char_len[n] = max(1, int(v or 1))
+            for n, v in zip(unmapped, vals):
+                char_len[n] = _validate_char_len(n, int(v or 1), block, snum)
         for n in char_cols:
             char_len.setdefault(n, 1)
-            if char_len[n] > SAS_MAX_CHAR:
-                raise SASDuckDBTransferError(
-                    'Column "{}" has values longer than the SAS maximum of '
-                    '{} bytes.'.format(n, SAS_MAX_CHAR), block=block, stmt=snum)
-
-        # COPY select list with normalization casts
-        sel_parts = []
-        lengths = []
-        formats = []
-        inputs = []
-        for name, dtype in cols:
-            qn = '"' + name.replace('"', '""') + '"'
-            nl = "'" + name.replace("'", "''") + "'n"
-            base = dtype.split('(')[0]
-            if base in _UNSUPPORTED_DUCK_TYPES or dtype.endswith('[]'):
-                raise SASDuckDBNotSupportedError(
-                    'Result column "{}" has DuckDB type {} which cannot be '
-                    'loaded into SAS. Cast it in your SQL.'.format(name, dtype),
-                    block=block, stmt=snum)
-            if base in _PRECISION_LOSS_TYPES and annotate:
-                annotate('warning: column "{}" ({}) may lose precision in SAS '
-                         'numeric (double)'.format(name, dtype))
-            if base == 'DECIMAL':
-                m = re.match(r'DECIMAL\((\d+)', dtype)
-                if m and int(m.group(1)) > 15 and annotate:
-                    annotate('warning: column "{}" ({}) may lose precision in '
-                             'SAS numeric (double)'.format(name, dtype))
-            if name in char_len:
-                sel_parts.append(
-                    "replace(replace({q}::varchar, chr(13), ' '), chr(10), ' ')"
-                    ' as {q}'.format(q=qn))
-                lengths.append('{} ${}'.format(nl, char_len[name]))
-                inputs.append('{} : ${}.'.format(nl, char_len[name]))
-            elif base == 'BOOLEAN':
-                sel_parts.append('{q}::int as {q}'.format(q=qn))
-                lengths.append('{} 8'.format(nl))
-                inputs.append(nl)
-            elif base == 'DATE':
-                sel_parts.append(qn)
-                lengths.append('{} 8'.format(nl))
-                formats.append('{} E8601DA.'.format(nl))
-                inputs.append('{} : ??yymmdd10.'.format(nl))
-            elif base.startswith('TIMESTAMP') or base == 'DATETIME':
-                # covers TIMESTAMP, DATETIME, TIMESTAMP_NS/_MS/_S, and
-                # TIMESTAMP WITH TIME ZONE - all normalized to microsecond
-                # timezone-naive timestamps for the CSV
-                if base in ('TIMESTAMP', 'DATETIME'):
-                    sel_parts.append(qn)
-                else:
-                    if annotate:
-                        if 'ZONE' in base or 'TZ' in base:
-                            annotate('note: column "{}" converted to '
-                                     'timezone-naive timestamp'.format(name))
-                        elif base == 'TIMESTAMP_NS':
-                            annotate('note: column "{}" truncated from nano- '
-                                     'to microsecond precision'.format(name))
-                    sel_parts.append('{q}::timestamp as {q}'.format(q=qn))
-                lengths.append('{} 8'.format(nl))
-                formats.append('{} E8601DT26.6'.format(nl))
-                inputs.append('{} : ??e8601dt26.6'.format(nl))
-            elif base.startswith('TIME'):
-                # covers TIME and TIME WITH TIME ZONE
-                if base == 'TIME':
-                    sel_parts.append(qn)
-                else:
-                    if annotate:
-                        annotate('note: column "{}" converted to timezone-'
-                                 'naive time'.format(name))
-                    sel_parts.append('{q}::time as {q}'.format(q=qn))
-                lengths.append('{} 8'.format(nl))
-                formats.append('{} E8601TM15.6'.format(nl))
-                inputs.append('{} : ??e8601tm15.6'.format(nl))
-            else:
-                sel_parts.append(qn)
-                lengths.append('{} 8'.format(nl))
-                inputs.append(nl)
 
         csv_path = os.path.join(tmpdir, '_spddb_{}_{}.csv'.format(
             os.getpid(), abs(hash((libref, table, snum))) % 99991))
+        sel_parts, code = _build_load_codegen(
+            cols, char_len, tmpdir, libref, table, outfmts=outfmts,
+            labels=labels, outdsopts=outdsopts, datetimes=datetimes,
+            annotate=annotate, block=block, snum=snum, csv_path=csv_path)
+
         con.execute(
             "copy (select {sel} from {q}) to '{p}' (format csv, header true, "
             "nullstr '', dateformat '%Y-%m-%d', "
@@ -1025,19 +1133,6 @@ def duckdb_relation_to_sas_table(sas, con, select_sql, libref, table, tmpdir,
                 sel=', '.join(sel_parts), q=qual,
                 p=csv_path.replace("'", "''")))
         t_copy = time.time()
-
-        lrecl = max(1048576, sum(char_len.values()) + 64 * len(cols))
-        code = 'data {};\n'.format(_sas_name_ref(libref, table))
-        code += '  length {};\n'.format(' '.join(lengths))
-        if formats:
-            code += '  format {};\n'.format(' '.join(formats))
-        code += ("  infile '{p}' dlm=',' dsd firstobs=2 missover lrecl={l} "
-                 "encoding='utf-8' termstr=LF;\n").format(
-                     p=csv_path.replace("'", "''"), l=lrecl)
-        code += '  input {};\nrun;\n'.format(' '.join(inputs))
-
-        if sas.nosub:
-            return code
 
         ll = sas._io.submit(code, results='text')
         if sas._io._checkLogForError(ll['LOG']):

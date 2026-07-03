@@ -3016,6 +3016,104 @@ class SASsession():
         finally:
             self._lastlog = self._io._log[lastlog:]
 
+    def duckdb_to_sas(self, con, query: str = '', table: str = '_ddb',
+                      libref: str = '', results: str = '', outfmts: dict = None,
+                      labels: dict = None, outdsopts: dict = None,
+                      char_lengths: dict = None, datetimes: dict = None,
+                      tempdir: str = None, tempkeep: bool = False) -> 'SASdata':
+        """
+        Execute a DuckDB query and load its result into a SAS dataset, fast:
+        the result is materialized once in DuckDB, written to CSV on tmpfs by
+        DuckDB's parallel COPY, and read by a single generated DATA step with
+        exact byte lengths and ISO date/time informats. Requires the STDIO
+        (local, shared-filesystem) access method and the duckdb package.
+
+        :param con: a duckdb.DuckDBPyConnection
+        :param query: SQL to run in DuckDB; a bare table/view name is treated
+            as 'select * from <name>'
+        :param table: name of the SAS dataset to create (default '_ddb')
+        :param libref: target libref (default WORK); must be assigned
+        :param results: format for the returned SASdata object
+        :param outfmts: dict of column: SAS format overriding the defaults
+            (E8601DA. / E8601DT26.6 / E8601TM15.6 for date/datetime/time)
+        :param labels: dict of column: label
+        :param outdsopts: dict of output dataset options, e.g.
+            {'compress': 'yes'}
+        :param char_lengths: dict of column: byte length for character
+            columns; listed columns skip the max-length scan
+        :param datetimes: dict of column: 'date' to load a DuckDB TIMESTAMP
+            column as a SAS date
+        :param tempdir: override the tmpfs scratch directory (/dev/shm
+            default); must be readable by SAS
+        :param tempkeep: keep the scratch CSV for debugging
+
+        :return: SASdata object for the created dataset. Raises
+            saspy.sasexceptions.SASDuckDBExecutionError /
+            SASDuckDBTransferError on DuckDB or SAS failures. With
+            teach_me_SAS on, returns the generated DATA step code without
+            executing anything.
+        """
+        if self.sascfg.mode != 'STDIO':
+            raise SASIONotSupportedError('duckdb_to_sas (requires local STDIO '
+                                         'access method)', alts=['STDIO'])
+        try:
+            import duckdb
+        except ImportError:
+            raise ImportError('duckdb_to_sas requires the duckdb package. '
+                              'Install it with: pip install duckdb')
+        if not isinstance(con, duckdb.DuckDBPyConnection):
+            raise TypeError('con must be a duckdb.DuckDBPyConnection, got '
+                            + str(type(con)))
+
+        from saspy.sasduckdb import duckdb_relation_to_sas_table
+        from saspy.sasexceptions import SASDuckDBError
+
+        if not query or not query.strip():
+            raise SASDuckDBError('query is required: pass SQL or a DuckDB '
+                                 'table/view name')
+        query = query.strip()
+        if not re.search(r'\s', query):
+            query = 'select * from ' + query
+        if libref and libref.lower() not in \
+                [l.lower() for l in self.assigned_librefs()]:
+            raise SASDuckDBError("libref '{}' is not assigned in the SAS "
+                                 'session'.format(libref))
+
+        lastlog = len(self._io._log)
+        try:
+            if self.nosub:
+                return duckdb_relation_to_sas_table(
+                    self, con, query, libref, table, None,
+                    outfmts=outfmts, labels=labels, outdsopts=outdsopts,
+                    char_lengths=char_lengths, datetimes=datetimes,
+                    codegen_only=True)
+
+            if tempdir:
+                tmpdir = tempdir            # caller-owned; only the CSV is
+                os.makedirs(tmpdir, exist_ok=True)   # cleaned (tempkeep=False)
+                own_tmpdir = False
+            else:
+                base = ('/dev/shm' if os.path.isdir('/dev/shm')
+                        else tempfile.gettempdir())
+                tmpdir = tempfile.mkdtemp(prefix='saspy_ddb_', dir=base)
+                own_tmpdir = True
+            try:
+                duckdb_relation_to_sas_table(
+                    self, con, query, libref, table, tmpdir,
+                    tempkeep=tempkeep, outfmts=outfmts, labels=labels,
+                    outdsopts=outdsopts, char_lengths=char_lengths,
+                    datetimes=datetimes)
+            finally:
+                if own_tmpdir and not tempkeep:
+                    shutil.rmtree(tmpdir, ignore_errors=True)
+
+            if self.exist(table, libref):
+                return SASdata(self, libref, table, results)
+            raise SASDuckDBError('load appeared to succeed but {} was not '
+                                 'found'.format((libref or 'WORK') + '.' + table))
+        finally:
+            self._lastlog = self._io._log[lastlog:]
+
     def disconnect(self):
         """
         This method disconnects an IOM session to allow for reconnecting when switching networks

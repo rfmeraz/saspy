@@ -1463,21 +1463,25 @@ class SasToDuckDB(object):
         import duckdb as _duckdb
         if opts['noprint']:
             # SAS still executes a SELECT under NOPRINT (errors surface,
-            # SQLOBS is set); only the output is suppressed
+            # SQLOBS is set); only the output is suppressed. Run the real
+            # query and fetch its first row - a count(*) wrapper would let
+            # DuckDB prune the SELECT list and skip runtime errors in
+            # projected expressions. Stopping after the first row also
+            # matches native SAS, which sets SQLOBS=1 for a destination-less
+            # NOPRINT select.
             t0 = time.time()
             try:
-                n = self.con.execute('select count(*) from ({}) _spddb_q'
-                                     .format(sql)).fetchone()[0]
+                row = self.con.sql(sql).fetchone()
             except _duckdb.Error as e:
                 raise SASDuckDBExecutionError(
                     'DuckDB failed executing rerouted SQL: {}'.format(e),
                     block=bnum, stmt=snum) from e
-            # native SAS sets SQLOBS=1 for a NOPRINT select with no
-            # destination (it stops after the first row); match that
-            self._set_sqlmacros(1 if n else 0)
+            self._set_sqlmacros(1 if row is not None else 0)
             self._annotate('[block {}, stmt {}] SELECT executed, output '
-                           'suppressed (noprint; {} rows, {:.2f}s)'
-                           .format(bnum, snum, n, time.time() - t0))
+                           'suppressed (noprint; result {}, {:.2f}s)'
+                           .format(bnum, snum,
+                                   'empty' if row is None else 'non-empty',
+                                   time.time() - t0))
             return
         t0 = time.time()
         try:

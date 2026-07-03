@@ -389,6 +389,12 @@ class TestSasToDuckDBCsv(unittest.TestCase):
         with self.assertRaises(SASDuckDBExecutionError):
             self._run('proc sql noprint; '
                       'select no_such_col from work.claims; quit;')
+        # runtime errors in projected expressions must surface too (a
+        # count(*) wrapper would let DuckDB prune them away)
+        with self.assertRaises(SASDuckDBExecutionError):
+            self._run('proc sql noprint; '
+                      "select (note || 'x')::int as bad from work.claims; "
+                      'quit;')
 
     def test_timestamp_and_time_variants(self):
         self._run("""

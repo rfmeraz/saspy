@@ -41,7 +41,9 @@ Known limitations (both transports unless noted):
     semantics); use SAS name literals ('my col'n) for quoted identifiers.
   * jdbc transport: the DuckDB database is a file owned by the SAS JVM; a live
     Python duckdb connection cannot be used (DuckDB allows only one read-write
-    process per database file). TIME values lose sub-second precision.
+    process per database file). TIME values lose sub-second precision. TIMETZ
+    result columns trip a fetch bug in the DuckDB JDBC driver - cast them
+    (::time) in your SQL; the csv transport normalizes them automatically.
 """
 
 import logging
@@ -979,20 +981,33 @@ def duckdb_relation_to_sas_table(sas, con, select_sql, libref, table, tmpdir,
                 lengths.append('{} 8'.format(nl))
                 formats.append('{} E8601DA.'.format(nl))
                 inputs.append('{} : ??yymmdd10.'.format(nl))
-            elif base in ('TIMESTAMP', 'DATETIME', 'TIMESTAMPTZ',
-                          'TIMESTAMP WITH TIME ZONE'):
-                if 'TZ' in base or 'ZONE' in base:
-                    if annotate:
-                        annotate('note: column "{}" converted to timezone-naive '
-                                 'timestamp'.format(name))
-                    sel_parts.append('{q}::timestamp as {q}'.format(q=qn))
-                else:
+            elif base.startswith('TIMESTAMP') or base == 'DATETIME':
+                # covers TIMESTAMP, DATETIME, TIMESTAMP_NS/_MS/_S, and
+                # TIMESTAMP WITH TIME ZONE - all normalized to microsecond
+                # timezone-naive timestamps for the CSV
+                if base in ('TIMESTAMP', 'DATETIME'):
                     sel_parts.append(qn)
+                else:
+                    if annotate:
+                        if 'ZONE' in base or 'TZ' in base:
+                            annotate('note: column "{}" converted to '
+                                     'timezone-naive timestamp'.format(name))
+                        elif base == 'TIMESTAMP_NS':
+                            annotate('note: column "{}" truncated from nano- '
+                                     'to microsecond precision'.format(name))
+                    sel_parts.append('{q}::timestamp as {q}'.format(q=qn))
                 lengths.append('{} 8'.format(nl))
                 formats.append('{} E8601DT26.6'.format(nl))
                 inputs.append('{} : ??e8601dt26.6'.format(nl))
-            elif base == 'TIME':
-                sel_parts.append(qn)
+            elif base.startswith('TIME'):
+                # covers TIME and TIME WITH TIME ZONE
+                if base == 'TIME':
+                    sel_parts.append(qn)
+                else:
+                    if annotate:
+                        annotate('note: column "{}" converted to timezone-'
+                                 'naive time'.format(name))
+                    sel_parts.append('{q}::time as {q}'.format(q=qn))
                 lengths.append('{} 8'.format(nl))
                 formats.append('{} E8601TM15.6'.format(nl))
                 inputs.append('{} : ??e8601tm15.6'.format(nl))
@@ -1447,8 +1462,22 @@ class SasToDuckDB(object):
     def _run_bare_select_csv(self, sql, opts, bnum, snum):
         import duckdb as _duckdb
         if opts['noprint']:
-            self._annotate('[block {}, stmt {}] SELECT skipped (noprint)'
-                           .format(bnum, snum))
+            # SAS still executes a SELECT under NOPRINT (errors surface,
+            # SQLOBS is set); only the output is suppressed
+            t0 = time.time()
+            try:
+                n = self.con.execute('select count(*) from ({}) _spddb_q'
+                                     .format(sql)).fetchone()[0]
+            except _duckdb.Error as e:
+                raise SASDuckDBExecutionError(
+                    'DuckDB failed executing rerouted SQL: {}'.format(e),
+                    block=bnum, stmt=snum) from e
+            # native SAS sets SQLOBS=1 for a NOPRINT select with no
+            # destination (it stops after the first row); match that
+            self._set_sqlmacros(1 if n else 0)
+            self._annotate('[block {}, stmt {}] SELECT executed, output '
+                           'suppressed (noprint; {} rows, {:.2f}s)'
+                           .format(bnum, snum, n, time.time() - t0))
             return
         t0 = time.time()
         try:
@@ -1461,6 +1490,11 @@ class SasToDuckDB(object):
         truncated = len(df) > self.render_limit
         if truncated:
             df = df.iloc[:self.render_limit]
+            nrows = self.con.execute('select count(*) from ({}) _spddb_q'
+                                     .format(sql)).fetchone()[0]
+        else:
+            nrows = len(df)
+        self._set_sqlmacros(nrows)
         if self.results == 'html':
             out = df.to_html(index=False)
         else:

@@ -376,6 +376,46 @@ class TestSasToDuckDBCsv(unittest.TestCase):
         """)
         self.assertEqual(ll2['LST'].strip(), '')
 
+    def test_noprint_select_still_executes(self):
+        # NOPRINT suppresses output only: the query must run, surface errors,
+        # and set SQLOBS. Native SAS sets SQLOBS=1 for a destination-less
+        # NOPRINT select; both transports match that.
+        self._run("""
+        proc sql noprint;
+          select state from work.claims;
+        quit;
+        """)
+        self.assertEqual(int(self.sas.symget('SQLOBS')), 1)
+        with self.assertRaises(SASDuckDBExecutionError):
+            self._run('proc sql noprint; '
+                      'select no_such_col from work.claims; quit;')
+
+    def test_timestamp_and_time_variants(self):
+        self._run("""
+        proc sql;
+          create table work.tsv as select
+            '2021-06-01 08:09:10.123456789'::TIMESTAMP_NS as ts_ns,
+            '2021-06-01 08:09:10.123'::TIMESTAMP_MS       as ts_ms,
+            '2021-06-01 08:09:10'::TIMESTAMP_S            as ts_s,
+            '2021-06-01 08:09:10.5+00'::TIMESTAMPTZ       as ts_tz,
+            '14:30:00.25+02'::TIMETZ                      as tm_tz;
+        quit;
+        """)
+        df = self.sas.sd2df('tsv')
+        self.assertEqual(str(df['ts_ns'][0]), '2021-06-01 08:09:10.123456')
+        self.assertEqual(str(df['ts_ms'][0]), '2021-06-01 08:09:10.123000')
+        self.assertEqual(str(df['ts_s'][0]), '2021-06-01 08:09:10')
+        # tz-naive conversion happens in DuckDB's session timezone
+        chk = duckdb.connect()
+        want_tz = str(chk.execute(
+            "select ('2021-06-01 08:09:10.5+00'::TIMESTAMPTZ)::timestamp"
+        ).fetchone()[0])
+        want_tm = str(chk.execute(
+            "select ('14:30:00.25+02'::TIMETZ)::time").fetchone()[0])
+        chk.close()
+        self.assertEqual(str(df['ts_tz'][0]), want_tz)
+        self.assertIn(want_tm.split('.')[0], str(df['tm_tz'][0]))
+
     def test_fedsql_block(self):
         ll = self._run("""
         proc fedsql;
@@ -531,6 +571,32 @@ class TestSasToDuckDBJdbc(TestSasToDuckDBCsv):
         want = [str(x).strip() for x in orig['note'].fillna('')]
         self.assertEqual(got, want)
         self.assertEqual(df['amt'].isna().sum(), orig['amt'].isna().sum())
+
+    def test_timestamp_and_time_variants(self):
+        # timestamp variants fetch fine through the JDBC driver; TIMETZ
+        # triggers a driver NPE - documented: cast it (::time) in your SQL
+        self._run("""
+        proc sql;
+          create table work.tsv as select
+            '2021-06-01 08:09:10.123456789'::TIMESTAMP_NS as ts_ns,
+            '2021-06-01 08:09:10.123'::TIMESTAMP_MS       as ts_ms,
+            '2021-06-01 08:09:10'::TIMESTAMP_S            as ts_s;
+        quit;
+        """)
+        df = self.sas.sd2df('tsv')
+        self.assertEqual(str(df['ts_ns'][0]), '2021-06-01 08:09:10.123456')
+        self.assertEqual(str(df['ts_ms'][0]), '2021-06-01 08:09:10.123000')
+        self.assertEqual(str(df['ts_s'][0]), '2021-06-01 08:09:10')
+        with self.assertRaises(SASDuckDBExecutionError):
+            self._run("proc sql; create table work.tsx as select "
+                      "'14:30:00.25+02'::TIMETZ as tm; quit;")
+        self._run("""
+        proc sql;
+          create table work.tsx as select '14:30:00.25+02'::TIMETZ::time as tm;
+        quit;
+        """)
+        df = self.sas.sd2df('tsx')
+        self.assertIn(':30:00', str(df['tm'][0]))
 
 
 if __name__ == '__main__':

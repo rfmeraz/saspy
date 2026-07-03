@@ -2929,6 +2929,93 @@ class SASsession():
 
         return bool(var)
 
+    def sas_to_duckdb(self, code: str, con=None, transport: str = 'csv',
+                      duckdb_file: str = None, jdbc_classpath: str = None,
+                      jdbc_text_len: int = 1024, results: str = '',
+                      tempdir: str = None, tempkeep: bool = False,
+                      keep_duckdb_objects: bool = False, render_limit: int = 1000,
+                      stop_on_sas_error: bool = True, echo_sql: bool = True) -> dict:
+        """
+        Submit a string of SAS code in which every PROC SQL / PROC FEDSQL block
+        is executed by DuckDB instead of SAS. Non-SQL SAS segments run in SAS
+        unchanged, in original order. Supported SQL statements: CREATE TABLE
+        [libref.]name AS SELECT (result loaded into SAS), SELECT ... INTO
+        :macrovar [SEPARATED BY 'c'] (macro variables set in the session), and
+        bare SELECT (rendered into the returned LST). &macrovar references in
+        the SQL are resolved from the live session. Anything else raises a
+        saspy.sasexceptions.SASDuckDBError subclass (DuckDB-or-error policy;
+        there is no silent fallback to SAS).
+
+        Requires the STDIO (local, shared-filesystem) access method.
+
+        :param code: SAS source to run
+        :param con: [csv transport] a duckdb connection; None uses a private
+            in-memory database for the call. Must be None for jdbc transport
+            (DuckDB allows a single read-write process per database file).
+        :param transport: 'csv' (default) - DuckDB runs in this Python process,
+            data moves via CSV on tmpfs; 'jdbc' - SQL blocks become PROC SQL
+            explicit pass-through and DuckDB runs inside the SAS JVM via
+            SAS/ACCESS to JDBC (requires the DuckDB JDBC driver and the
+            saspy DuckDBSASDriver shim installed in the SAS deployment's
+            JDBC DataDrivers directory).
+        :param duckdb_file: [jdbc] path for the DuckDB database file; default
+            is a temp file removed after the call
+        :param jdbc_classpath: [jdbc] directory containing the DuckDB JDBC jar
+            and the shim jar
+        :param jdbc_text_len: [jdbc] reported SAS char length for VARCHAR
+            result columns (DuckDB does not carry column lengths)
+        :param results: 'text' or 'html' for rendered SELECTs and SAS output;
+            defaults to the session results setting
+        :param tempdir: override the tmpfs scratch directory (/dev/shm default)
+        :param tempkeep: keep scratch CSV files for debugging
+        :param keep_duckdb_objects: [csv] leave shipped/created tables in con
+        :param render_limit: row cap when rendering bare SELECTs
+        :param stop_on_sas_error: raise SASDuckDBSASCodeError when a
+            passthrough SAS segment logs an ERROR (default True)
+        :param echo_sql: include the rewritten SQL in DUCKDB: log annotations
+
+        :return: dict with keys LOG and LST, like submit(). The LOG interleaves
+            the real SAS logs with 'DUCKDB:' annotation lines (row counts,
+            timings, shipped tables). With teach_me_SAS on, returns the
+            execution plan in LOG without running anything.
+        """
+        if self.sascfg.mode != 'STDIO':
+            raise SASIONotSupportedError('sas_to_duckdb (requires local STDIO '
+                                         'access method)', alts=['STDIO'])
+        if transport not in ('csv', 'jdbc'):
+            raise SASConfigNotValidError('transport',
+                                         "must be 'csv' or 'jdbc'")
+        if transport == 'jdbc' and con is not None:
+            raise ValueError("transport='jdbc' cannot use a Python duckdb "
+                             "connection: DuckDB permits one read-write "
+                             "process per database file and the SAS JVM owns "
+                             "it in jdbc mode. Pass duckdb_file= instead.")
+        try:
+            import duckdb
+        except ImportError:
+            raise ImportError('sas_to_duckdb requires the duckdb package. '
+                              'Install it with: pip install duckdb')
+        if con is not None and not isinstance(con, duckdb.DuckDBPyConnection):
+            raise TypeError('con must be a duckdb.DuckDBPyConnection, got '
+                            + str(type(con)))
+
+        from saspy.sasduckdb import SasToDuckDB
+
+        lastlog = len(self._io._log)
+        engine = SasToDuckDB(self, con=con, transport=transport,
+                             duckdb_file=duckdb_file,
+                             jdbc_classpath=jdbc_classpath,
+                             jdbc_text_len=jdbc_text_len, results=results,
+                             tempdir=tempdir, tempkeep=tempkeep,
+                             keep_duckdb_objects=keep_duckdb_objects,
+                             render_limit=render_limit,
+                             stop_on_sas_error=stop_on_sas_error,
+                             echo_sql=echo_sql)
+        try:
+            return engine.run(code)
+        finally:
+            self._lastlog = self._io._log[lastlog:]
+
     def disconnect(self):
         """
         This method disconnects an IOM session to allow for reconnecting when switching networks

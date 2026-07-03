@@ -117,4 +117,49 @@ class SASsubmitTimeout(Exception):
     """Raised when a submitted SAS job does not complete within submit_timeout seconds."""
 
 
+class SASDuckDBError(Exception):
+    """Base class for errors raised by SASsession.sas_to_duckdb().
+
+    Attributes:
+        block   1-based index of the SQL block the error occurred in (None if n/a)
+        stmt    1-based index of the statement within the block (None if n/a)
+        partial dict with 'LOG' and 'LST' accumulated before the error; SAS segments
+                that already ran are reflected in the live SAS session state
+    """
+    def __init__(self, msg: str, block: int=None, stmt: int=None):
+        self.msg     = msg
+        self.block   = block
+        self.stmt    = stmt
+        self.partial = None
+
+    def __str__(self):
+        where = ''
+        if self.block is not None:
+            where = ' [SQL block {}{}]'.format(self.block, ', statement {}'.format(self.stmt) if self.stmt else '')
+        note = ''
+        if self.partial is not None:
+            note = "\nNOTE: segments before this error already executed in SAS; the session state reflects them."
+        return '{}{}{}'.format(self.msg, where, note)
+
+
+class SASDuckDBNotSupportedError(SASDuckDBError):
+    """A statement, option, or construct that sas_to_duckdb does not support."""
+
+
+class SASDuckDBMacroError(SASDuckDBError):
+    """A macro variable reference in rerouted SQL could not be resolved."""
+
+
+class SASDuckDBExecutionError(SASDuckDBError):
+    """DuckDB failed to parse or execute a rerouted SQL statement."""
+
+
+class SASDuckDBTransferError(SASDuckDBError):
+    """A SAS step moving data between SAS and DuckDB logged an ERROR."""
+
+
+class SASDuckDBSASCodeError(SASDuckDBError):
+    """A passthrough SAS segment logged an ERROR (stop_on_sas_error=True)."""
+
+
 

@@ -18,3 +18,5 @@ build/
 dist/
 misc/
 saspy/__pycache__/
+# roborev snapshots
+/.roborev/

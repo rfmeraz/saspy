@@ -3074,19 +3074,22 @@ class SASsession():
         query = query.strip()
         if not re.search(r'\s', query):
             query = 'select * from ' + query
-        if libref and libref.lower() not in \
-                [l.lower() for l in self.assigned_librefs()]:
-            raise SASDuckDBError("libref '{}' is not assigned in the SAS "
-                                 'session'.format(libref))
 
         lastlog = len(self._io._log)
         try:
             if self.nosub:
+                # codegen only - no session round trips, so no live libref
+                # validation (assigned_librefs() returns None under nosub)
                 return duckdb_relation_to_sas_table(
                     self, con, query, libref, table, None,
                     outfmts=outfmts, labels=labels, outdsopts=outdsopts,
                     char_lengths=char_lengths, datetimes=datetimes,
                     codegen_only=True)
+
+            if libref and libref.lower() not in \
+                    [l.lower() for l in self.assigned_librefs()]:
+                raise SASDuckDBError("libref '{}' is not assigned in the SAS "
+                                     'session'.format(libref))
 
             if tempdir:
                 tmpdir = tempdir            # caller-owned; only the CSV is

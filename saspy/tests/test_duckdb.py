@@ -175,6 +175,19 @@ class TestDuckdbToSas(unittest.TestCase):
         self.assertIn('length', code)
         self.assertFalse(self.sas.exist('ddb_nosub', 'work'))
 
+    def test_teach_me_sas_with_libref(self):
+        # libref validation needs a live session; under teach_me_SAS the
+        # codegen path must not attempt it (assigned_librefs returns None)
+        self.sas.teach_me_SAS(True)
+        try:
+            code = self.sas.duckdb_to_sas(self.ddb, 'test_mixed',
+                                          table='ddb_ns2', libref='work')
+        finally:
+            self.sas.teach_me_SAS(False)
+        self.assertIsInstance(code, str)
+        self.assertIn('work.', code.lower())
+        self.assertFalse(self.sas.exist('ddb_ns2', 'work'))
+
 
 if __name__ == '__main__':
     unittest.main()
